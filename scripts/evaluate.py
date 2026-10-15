@@ -1,0 +1,178 @@
+"""
+evaluate.py — Load checkpoint and run full evaluation
+Usage:
+    python scripts/evaluate.py --checkpoint checkpoints/best_model.pth
+    python scripts/evaluate.py --checkpoint checkpoints/best_model.pth --tta
+    python scripts/evaluate.py --checkpoint checkpoints/best_model.pth --gradcam
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import argparse
+import torch
+from omegaconf import OmegaConf
+from pathlib import Path
+
+from src.models.cancernet import CancerNet
+from src.utils.dataset import get_dataloaders
+from src.utils.augmentations import get_train_transforms, get_val_transforms
+from src.utils.seed import set_seed
+from src.evaluation.metrics import (
+    compute_metrics, print_evaluation_report,
+    find_optimal_threshold, plot_roc_curve, plot_confusion_matrix,
+)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--config", default="configs/config.yaml")
+    parser.add_argument("--tta", action="store_true", help="Use TTA")
+    parser.add_argument("--gradcam", action="store_true", help="Generate Grad-CAM samples")
+    parser.add_argument("--n-gradcam", type=int, default=10)
+    args = parser.parse_args()
+
+    # Load config
+    cfg = OmegaConf.load(args.config)
+    set_seed(cfg.project.seed)
+    device = torch.device(cfg.project.device if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # Load checkpoint
+    print(f"Loading checkpoint: {args.checkpoint}")
+    # weights_only=False: our own checkpoints store a metrics dict with numpy scalars,
+    # which PyTorch 2.6+ rejects under the new weights_only=True default.
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+
+    model = CancerNet(cfg)
+    model.load_state_dict(ckpt["model_state"])
+    model = model.to(device)
+    model.eval()
+    print(f"Checkpoint from epoch {ckpt.get('epoch', '?')}, "
+          f"val AUC={ckpt.get('metrics', {}).get('auc', '?'):.4f}")
+
+    # Dataloaders (same dataset switch as training)
+    if cfg.data.get("dataset", "idc").lower() == "breakhis":
+        from src.utils.breakhis import get_breakhis_dataloaders
+        _, _, test_loader = get_breakhis_dataloaders(
+            root_dir=cfg.data.breakhis_dir,
+            train_transform=get_train_transforms(cfg.data.image_size),
+            val_transform=get_val_transforms(cfg.data.image_size),
+            batch_size=cfg.training.batch_size,
+            num_workers=cfg.data.num_workers,
+            seed=cfg.project.seed,
+            image_size=cfg.data.image_size,
+            magnification=cfg.data.get("magnification", None),
+        )
+    else:
+        _, _, test_loader = get_dataloaders(
+            root_dir=cfg.data.raw_dir,
+            train_transform=get_train_transforms(cfg.data.image_size),
+            val_transform=get_val_transforms(cfg.data.image_size),
+            batch_size=cfg.training.batch_size,
+            num_workers=cfg.data.num_workers,
+            seed=cfg.project.seed,
+        )
+
+    # Standard evaluation
+    print("\nRunning standard evaluation...")
+    all_logits, all_labels = [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            images = batch["image"].to(device)
+            out = model(images)
+            all_logits.append(out["logits"].cpu())
+            all_labels.append(batch["label"])
+
+    all_logits = torch.cat(all_logits)
+    all_labels = torch.cat(all_labels)
+
+    # Standard metrics
+    metrics = compute_metrics(all_logits, all_labels)
+    print_evaluation_report(metrics, "Standard Evaluation")
+
+    # Optimal threshold
+    opt_thresh = find_optimal_threshold(all_logits, all_labels, optimize_for="sensitivity")
+    print(f"Optimal threshold (max sensitivity @ specificity>=90%): {opt_thresh:.3f}")
+    opt_metrics = compute_metrics(all_logits, all_labels, threshold=opt_thresh)
+    print_evaluation_report(opt_metrics, f"Optimal Threshold ({opt_thresh:.3f})")
+
+    # ROC curve
+    os.makedirs(cfg.logging.results_dir, exist_ok=True)
+    plot_roc_curve(all_logits, all_labels, f"{cfg.logging.results_dir}/roc_curve.png")
+
+    # Confusion matrix + machine-readable metrics.json
+    import json
+    from datetime import datetime
+    plot_confusion_matrix(opt_metrics, f"{cfg.logging.results_dir}/confusion_matrix.png",
+                          threshold=opt_thresh)
+    results_payload = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "checkpoint": args.checkpoint,
+        "checkpoint_epoch": ckpt.get("epoch"),
+        "dataset": cfg.data.get("dataset", "idc"),
+        "test_images": int(all_labels.numel()),
+        "n_benign": int((all_labels == 0).sum().item()),
+        "n_malignant": int((all_labels == 1).sum().item()),
+        "optimal_threshold": round(float(opt_thresh), 4),
+        "metrics_at_0.5": {k: round(float(v), 6) for k, v in metrics.items()},
+        "metrics_at_optimal": {k: round(float(v), 6) for k, v in opt_metrics.items()},
+    }
+    metrics_path = os.path.join(cfg.logging.results_dir, "metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(results_payload, f, indent=2)
+    print(f"\nMetrics saved to {metrics_path}")
+
+    # TTA evaluation
+    if args.tta:
+        print("\nRunning TTA evaluation...")
+        from src.evaluation.tta import TTAEvaluator
+        tta_eval = TTAEvaluator(model, device, n_augments=cfg.augmentation.tta.n_augments)
+        tta_metrics = tta_eval.evaluate(test_loader)
+        print_evaluation_report(tta_metrics, "TTA Evaluation")
+
+    # Grad-CAM visualization
+    if args.gradcam:
+        print(f"\nGenerating {args.n_gradcam} Grad-CAM visualizations...")
+        from src.evaluation.gradcam import save_gradcam_visualization
+        gradcam_dir = Path(cfg.logging.results_dir) / "gradcam"
+        gradcam_dir.mkdir(parents=True, exist_ok=True)
+
+        # Need raw numpy images for Grad-CAM overlay
+        from src.utils.augmentations import MEAN, STD
+        import numpy as np
+
+        count = 0
+        for batch in test_loader:
+            for i in range(len(batch["label"])):
+                if count >= args.n_gradcam:
+                    break
+                img_tensor = batch["image"][i]
+                label = batch["label"][i].item()
+
+                # Get image_np: from batch if available, else reconstruct from tensor
+                if "image_np" in batch:
+                    img_np = batch["image_np"][i]
+                    if isinstance(img_np, torch.Tensor):
+                        img_np = img_np.numpy()
+                else:
+                    # Reverse normalize to get displayable image
+                    img_arr = img_tensor.permute(1, 2, 0).numpy()
+                    img_arr = img_arr * np.array(STD) + np.array(MEAN)
+                    img_np = (np.clip(img_arr, 0, 1) * 255).astype(np.uint8)
+
+                save_gradcam_visualization(
+                    model, img_tensor, img_np, label,
+                    save_path=str(gradcam_dir / f"sample_{count:03d}_label{label}.png"),
+                    device=device,
+                )
+                count += 1
+            if count >= args.n_gradcam:
+                break
+        print(f"Grad-CAM images saved to {gradcam_dir}/")
+
+
+if __name__ == "__main__":
+    main()
